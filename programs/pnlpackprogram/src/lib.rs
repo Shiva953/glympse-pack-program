@@ -24,6 +24,10 @@ pub mod pnlpackprogram {
     pub fn transfer_to_pack_pool(ctx: Context<TransferToPackPool>, amount: u64) -> Result<()> {
         TransferToPackPool::handler(ctx, amount)
     }
+
+    pub fn init_token_vault(ctx: Context<InitTokenVault>, kol_ticker: String) -> Result<()> {
+        InitTokenVault::handler(ctx, kol_ticker)
+    }
 }
 
 #[derive(Accounts)]
