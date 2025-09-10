@@ -6,7 +6,7 @@ mod errors;
 use anchor_lang::prelude::*;
 use instructions::*;
 
-declare_id!("Fn7BgzorgkmKfDJobqqaHeLxrfcvcobXoJsUMPeGmBUD");
+declare_id!("FbVs7B3iLiw8RLfQoo6DJ57y1ts1JawxVXKUkEH74dnb");
 
 #[program]
 pub mod pnlpackprogram {
@@ -27,6 +27,10 @@ pub mod pnlpackprogram {
 
     pub fn init_token_vault(ctx: Context<InitTokenVault>, kol_ticker: String) -> Result<()> {
         InitTokenVault::handler(ctx, kol_ticker)
+    }
+
+    pub fn transfer_kol_tokens_to_vault(ctx: Context<TransferKolTokensToVault>, kol_ticker: String, amount: u64) -> Result<()> {
+        TransferKolTokensToVault::handler(ctx, kol_ticker, amount)
     }
 }
 

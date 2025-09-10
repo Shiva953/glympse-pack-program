@@ -7,7 +7,8 @@ import {
   getOrCreateAssociatedTokenAccount, 
   mintTo, 
   getAccount,
-  TOKEN_PROGRAM_ID 
+  TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddressSync 
 } from "@solana/spl-token";
 import adminKeypair from "./admin.json";
 
@@ -75,7 +76,7 @@ describe("pnlpackprogram", () => {
       admin,
       admin.publicKey,
       admin.publicKey,
-      9
+      6 // Changed to 6 decimals as specified
     );
     
     console.log("Token mint created:", mintAddress.toString());
@@ -90,7 +91,8 @@ describe("pnlpackprogram", () => {
     
     console.log("Admin token account:", adminTokenAccount.toString());
     
-    const mintAmount = BigInt("1000000000000000000");
+    // Mint 1B tokens with 6 decimals: 1,000,000,000 * 10^6
+    const mintAmount = BigInt("1000000000000000");
     await mintTo(
       connection,
       admin,
@@ -102,7 +104,7 @@ describe("pnlpackprogram", () => {
     
     const tokenAccount = await getAccount(connection, adminTokenAccount);
     console.log("Admin token balance:", tokenAccount.amount.toString());
-    console.log("Admin token balance (human readable):", Number(tokenAccount.amount) / Math.pow(10, 9));
+    console.log("Admin token balance (human readable):", Number(tokenAccount.amount) / Math.pow(10, 6));
   });
 
   it("[TEST3] Initialize pack token vault for KOL", async () => {
@@ -192,6 +194,75 @@ describe("pnlpackprogram", () => {
       const vaultInfo = await getAccount(connection, tokenVaultAccount);
       console.log(`${kolTicker} vault address:`, tokenVaultAccount.toString());
       console.log(`${kolTicker} vault balance:`, vaultInfo.amount.toString());
+    }
+  });
+
+  it("[TEST5] Transfer 940M tokens from admin to token vault", async () => {
+    const kolTicker = "GAINZY";
+    const transferAmount = new anchor.BN("940000000000000"); // 940M tokens with 6 decimals
+    
+    console.log(`Transferring 940M tokens to ${kolTicker} vault...`);
+    
+    const [globalPackPoolAccount] = anchor.web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("global_pack_pool")], 
+      program.programId
+    );
+    
+    const [tokenVaultAccount] = anchor.web3.PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("token_vault"),
+        Buffer.from(kolTicker),
+        globalPackPoolAccount.toBuffer()
+      ],
+      program.programId
+    );
+    
+    const adminTokenAccountPDA = getAssociatedTokenAddressSync(
+      mintAddress,
+      admin.publicKey,
+      false,
+      TOKEN_PROGRAM_ID
+    );
+    
+    const adminBalanceBefore = await getAccount(connection, adminTokenAccountPDA);
+    const vaultBalanceBefore = await getAccount(connection, tokenVaultAccount);
+    
+    console.log("Admin balance before:", Number(adminBalanceBefore.amount) / Math.pow(10, 6));
+    console.log("Vault balance before:", Number(vaultBalanceBefore.amount) / Math.pow(10, 6));
+    
+    const tx = await program.methods.transferKolTokensToVault(kolTicker, transferAmount)
+      .accountsPartial({
+        globalPackPool: globalPackPoolAccount,
+        admin: admin.publicKey,
+        mint: mintAddress,
+        adminTokenAccount: adminTokenAccountPDA,
+        tokenVault: tokenVaultAccount,
+        systemProgram: anchor.web3.SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: anchor.utils.token.ASSOCIATED_PROGRAM_ID,
+        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+      })
+      .signers([admin])
+      .rpc({ commitment: "confirmed" });
+    
+    console.log("Transfer completed successfully:", tx);
+    
+    const adminBalanceAfter = await getAccount(connection, adminTokenAccountPDA);
+    const vaultBalanceAfter = await getAccount(connection, tokenVaultAccount);
+    
+    console.log("Admin balance after:", Number(adminBalanceAfter.amount) / Math.pow(10, 6));
+    console.log("Vault balance after:", Number(vaultBalanceAfter.amount) / Math.pow(10, 6));
+    
+    const transferredAmount = Number(vaultBalanceAfter.amount) - Number(vaultBalanceBefore.amount);
+    const expectedTransfer = 940000000; 
+    
+    console.log("Transferred amount:", transferredAmount / Math.pow(10, 6));
+    console.log("Expected transfer:", expectedTransfer);
+    
+    if (Math.abs(transferredAmount / Math.pow(10, 6) - expectedTransfer) < 0.001) {
+      console.log("✅ Transfer amount verified: 940M tokens successfully transferred!");
+    } else {
+      console.log("❌ Transfer amount mismatch!");
     }
   });
 
