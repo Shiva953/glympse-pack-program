@@ -12,29 +12,68 @@ import {
 } from "@solana/spl-token";
 import adminKeypair from "./admin.json";
 
+// Use explicit provider options to reduce stale blockhash issues
+const confirmOpts: anchor.web3.ConfirmOptions = {
+  commitment: "confirmed",
+  preflightCommitment: "confirmed",
+  skipPreflight: false,
+  maxRetries: 5,
+};
+const defaultProvider = anchor.AnchorProvider.env();
+const provider = new anchor.AnchorProvider(defaultProvider.connection, defaultProvider.wallet, confirmOpts);
+anchor.setProvider(provider);
+
+async function retryRpc<T>(fn: () => Promise<T>, retries = 2): Promise<T> {
+  try {
+    return await fn();
+  } catch (e: any) {
+    const msg = String(e);
+    if (retries > 0 && /Blockhash not found/i.test(msg)) {
+      // refresh blockhash
+      await provider.connection.getLatestBlockhash("confirmed");
+      return retryRpc(fn, retries - 1);
+    }
+    throw e;
+  }
+}
+
+// Pretty logging helpers
+function banner(title: string) {
+  console.log("\n========================================");
+  console.log(title);
+  console.log("========================================\n");
+}
+function step(title: string) {
+  console.log(`\n▶ ${title}`);
+}
+function kv(label: string, value: string | number | boolean) {
+  console.log(`  • ${label}: ${value}`);
+}
+
+
 describe("pnlpackprogram", () => {
   const admin = anchor.web3.Keypair.fromSecretKey(new Uint8Array(adminKeypair));
-  anchor.setProvider(anchor.AnchorProvider.env());
 
   const program = anchor.workspace.pnlpackprogram as Program<Pnlpackprogram>;
-  const provider = anchor.getProvider();
   const connection = provider.connection;
 
   let mintAddress: PublicKey;
   let adminTokenAccount: PublicKey;
 
   it("Is initialized!", async () => {
+    banner("INIT PROGRAM TEST");
     const tx = await program.methods.initialize().rpc();
-    console.log("Your transaction signature", tx);
+    kv("Initialize tx", tx);
   });
 
   it("[TEST1] Initializes the global packs pool(treasury) where all the raise money goes", async () => {
+    banner("TEST1: INIT GLOBAL PACK POOL (TREASURY)");
     const total_kols = 50;
-    console.log("50 TOP KOLS FROM LEADERBOARD")
+    kv("Total KOLs", total_kols);
     const [globalPackPoolAccount] =  anchor.web3.PublicKey.findProgramAddressSync([Buffer.from("global_pack_pool")], program.programId)
-    console.log("Global Pack Pool Account: ", globalPackPoolAccount.toString())
+    kv("Global Pack Pool PDA", globalPackPoolAccount.toString());
 
-    console.log("Creating Packs treasury....")
+    step("Send init_global_pack_pool");
     const tx = await program.methods.initGlobalPackPool(total_kols)
     .accountsPartial({
       admin: admin.publicKey,
@@ -42,18 +81,18 @@ describe("pnlpackprogram", () => {
     })
     .signers([admin])
     .rpc({commitment: "confirmed"});
-    console.log("Created global pack treasury pool: ", tx);
+    kv("Tx", tx);
   });
 
   it("[TEST2] Transfer 0.1 SOL from user to pool during pack raise", async () => {
-
+    banner("TEST2: TRANSFER 0.1 SOL TO POOL");
     const [globalPackPoolAccount] =  anchor.web3.PublicKey.findProgramAddressSync([Buffer.from("global_pack_pool")], program.programId)
     const amount = new anchor.BN(0.1 * LAMPORTS_PER_SOL);
 
     const balanceBefore = await connection.getBalance(globalPackPoolAccount)
-    const balanceBeforeInSOL = balanceBefore/LAMPORTS_PER_SOL;
-    console.log("PACK POOL TREASURY BALANCE(BEFORE)", balanceBeforeInSOL)
+    kv("Treasury balance (before, SOL)", balanceBefore/LAMPORTS_PER_SOL);
 
+    step("Send transfer_to_pack_pool");
     const tx = await program.methods.transferToPackPool(amount)
     .accountsPartial({
       globalPackPool: globalPackPoolAccount,
@@ -61,26 +100,23 @@ describe("pnlpackprogram", () => {
     })
     .signers([admin])
     .rpc({commitment: "confirmed"});
+    kv("Tx", tx);
 
     const balanceAfter = await connection.getBalance(globalPackPoolAccount)
-    const balanceAfterInSOL = balanceAfter/LAMPORTS_PER_SOL;
-    console.log("PACK POOL TREASURY BALANCE(AFTER): ", balanceAfterInSOL)
-
-    console.log("Successfully transferred 0.1 SOL to pack global pool", tx);
+    kv("Treasury balance (after, SOL)", balanceAfter/LAMPORTS_PER_SOL);
   });
 
   it("[SETUP] Create test token mint and mint 1B tokens to admin", async () => {
-    console.log("Creating test token mint...");
+    banner("SETUP: CREATE TEST MINT + MINT 1B TO ADMIN");
     
     mintAddress = await createMint(
       connection,
       admin,
       admin.publicKey,
       admin.publicKey,
-      6 // Changed to 6 decimals as specified
+      6 // 6 decimals
     );
-    
-    console.log("Token mint created:", mintAddress.toString());
+    kv("Mint", mintAddress.toString());
     
     const tokenAccountInfo = await getOrCreateAssociatedTokenAccount(
       connection,
@@ -89,11 +125,10 @@ describe("pnlpackprogram", () => {
       admin.publicKey
     );
     adminTokenAccount = tokenAccountInfo.address;
+    kv("Admin ATA", adminTokenAccount.toString());
     
-    console.log("Admin token account:", adminTokenAccount.toString());
-    
-    // Mint 1B tokens with 6 decimals: 1,000,000,000 * 10^6
-    const mintAmount = BigInt("1000000000000000");
+    const mintAmount = BigInt("1000000000000000"); // 1B * 10^6
+    step("Mint 1B tokens to admin");
     await mintTo(
       connection,
       admin,
@@ -102,189 +137,30 @@ describe("pnlpackprogram", () => {
       admin.publicKey,
       mintAmount
     );
-    
     const tokenAccount = await getAccount(connection, adminTokenAccount);
-    console.log("Admin token balance:", tokenAccount.amount.toString());
-    console.log("Admin token balance (human readable):", Number(tokenAccount.amount) / Math.pow(10, 6));
+    kv("Admin token balance (human)", Number(tokenAccount.amount) / Math.pow(10, 6));
   });
 
-  it("[TEST3] Initialize pack token vault for KOL", async () => {
-    const kolTicker = "GAINZY";
-    console.log(`Initializing token vault for KOL: ${kolTicker}`);
-    
-    const [globalPackPoolAccount] = anchor.web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("global_pack_pool")], 
-      program.programId
-    );
-    
-    const [tokenVaultAccount] = anchor.web3.PublicKey.findProgramAddressSync(
-      [
-        Buffer.from("token_vault"),
-        Buffer.from(kolTicker),
-        globalPackPoolAccount.toBuffer()
-      ],
-      program.programId
-    );
-    
-    console.log("Global pack pool:", globalPackPoolAccount.toString());
-    console.log("Token vault PDA:", tokenVaultAccount.toString());
-    console.log("Mint address:", mintAddress.toString());
-    
-    const tx = await program.methods.initTokenVault(kolTicker)
-      .accountsPartial({
-        globalPackPool: globalPackPoolAccount,
-        admin: admin.publicKey,
-        mint: mintAddress,
-        tokenVault: tokenVaultAccount,
-        systemProgram: anchor.web3.SystemProgram.programId,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        associatedTokenProgram: anchor.utils.token.ASSOCIATED_PROGRAM_ID,
-        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-      })
-      .signers([admin])
-      .rpc({ commitment: "confirmed" });
-    
-    console.log("Token vault initialized successfully:", tx);
-    
-    try {
-      const vaultInfo = await getAccount(connection, tokenVaultAccount);
-      console.log("Token vault created successfully!");
-      console.log("Vault mint:", vaultInfo.mint.toString());
-      console.log("Vault owner:", vaultInfo.owner.toString());
-      console.log("Vault balance:", vaultInfo.amount.toString());
-    } catch (error) {
-      console.error("Failed to fetch token vault info:", error);
-    }
-  });
-
-  it("[TEST4] Initialize multiple token vaults for different KOLs", async () => {
-    const kols = ["ELON", "VITALIK", "CZ"];
-    const [globalPackPoolAccount] = anchor.web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("global_pack_pool")], 
-      program.programId
-    );
-    
-    for (const kolTicker of kols) {
-      console.log(`\nInitializing token vault for KOL: ${kolTicker}`);
-      
-      const [tokenVaultAccount] = anchor.web3.PublicKey.findProgramAddressSync(
-        [
-          Buffer.from("token_vault"),
-          Buffer.from(kolTicker),
-          globalPackPoolAccount.toBuffer()
-        ],
-        program.programId
-      );
-      
-      const tx = await program.methods.initTokenVault(kolTicker)
-        .accountsPartial({
-          globalPackPool: globalPackPoolAccount,
-          admin: admin.publicKey,
-          mint: mintAddress,
-          tokenVault: tokenVaultAccount,
-          systemProgram: anchor.web3.SystemProgram.programId,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          associatedTokenProgram: anchor.utils.token.ASSOCIATED_PROGRAM_ID,
-          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-        })
-        .signers([admin])
-        .rpc({ commitment: "confirmed" });
-      
-      console.log(`${kolTicker} token vault initialized:`, tx);
-      
-      const vaultInfo = await getAccount(connection, tokenVaultAccount);
-      console.log(`${kolTicker} vault address:`, tokenVaultAccount.toString());
-      console.log(`${kolTicker} vault balance:`, vaultInfo.amount.toString());
-    }
-  });
-
-  it("[TEST5] Transfer 940M tokens from admin to token vault", async () => {
-    const kolTicker = "GAINZY";
-    const transferAmount = new anchor.BN("940000000000000"); // 940M tokens with 6 decimals
-    
-    console.log(`Transferring 940M tokens to ${kolTicker} vault...`);
-    
-    const [globalPackPoolAccount] = anchor.web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("global_pack_pool")], 
-      program.programId
-    );
-    
-    const [tokenVaultAccount] = anchor.web3.PublicKey.findProgramAddressSync(
-      [
-        Buffer.from("token_vault"),
-        Buffer.from(kolTicker),
-        globalPackPoolAccount.toBuffer()
-      ],
-      program.programId
-    );
-    
-    const adminTokenAccountPDA = getAssociatedTokenAddressSync(
-      mintAddress,
-      admin.publicKey,
-      false,
-      TOKEN_PROGRAM_ID
-    );
-    
-    const adminBalanceBefore = await getAccount(connection, adminTokenAccountPDA);
-    const vaultBalanceBefore = await getAccount(connection, tokenVaultAccount);
-    
-    console.log("Admin balance before:", Number(adminBalanceBefore.amount) / Math.pow(10, 6));
-    console.log("Vault balance before:", Number(vaultBalanceBefore.amount) / Math.pow(10, 6));
-    
-    const tx = await program.methods.transferKolTokensToVault(kolTicker, transferAmount)
-      .accountsPartial({
-        globalPackPool: globalPackPoolAccount,
-        admin: admin.publicKey,
-        mint: mintAddress,
-        adminTokenAccount: adminTokenAccountPDA,
-        tokenVault: tokenVaultAccount,
-        systemProgram: anchor.web3.SystemProgram.programId,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        associatedTokenProgram: anchor.utils.token.ASSOCIATED_PROGRAM_ID,
-        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-      })
-      .signers([admin])
-      .rpc({ commitment: "confirmed" });
-    
-    console.log("Transfer completed successfully:", tx);
-    
-    const adminBalanceAfter = await getAccount(connection, adminTokenAccountPDA);
-    const vaultBalanceAfter = await getAccount(connection, tokenVaultAccount);
-    
-    console.log("Admin balance after:", Number(adminBalanceAfter.amount) / Math.pow(10, 6));
-    console.log("Vault balance after:", Number(vaultBalanceAfter.amount) / Math.pow(10, 6));
-    
-    const transferredAmount = Number(vaultBalanceAfter.amount) - Number(vaultBalanceBefore.amount);
-    const expectedTransfer = 940000000; 
-    
-    console.log("Transferred amount:", transferredAmount / Math.pow(10, 6));
-    console.log("Expected transfer:", expectedTransfer);
-    
-    if (Math.abs(transferredAmount / Math.pow(10, 6) - expectedTransfer) < 0.001) {
-      console.log("✅ Transfer amount verified: 940M tokens successfully transferred!");
-    } else {
-      console.log("❌ Transfer amount mismatch!");
-    }
-  });
-
-  it("[TEST8] SUPER COMBINED: Create mint, mint 1B tokens, initialize vault, and transfer 940M in minimal transactions", async () => {
-    console.log("\n🚀🚀 SUPER COMBINED TEST: Mint creation → Mint tokens → Init vault → Transfer tokens");
-    console.log("Target: Reduce from 4 transactions to 2 transactions total");
+  it("[TEST8] SUPER COMBINED: Create mint, mint 1B tokens, initialize vault, and transfer 940M from admin->vault in minimal transactions", async () => {
+    banner("TEST8: SUPER COMBINED FLOW (MINT + VAULT + TRANSFER)");
     
     const kolTicker = "SUPER";
     const totalSupply = new anchor.BN("1000000000000000"); // 1B tokens with 6 decimals
     const vaultTransferAmount = new anchor.BN("940000000000000"); // 940M tokens with 6 decimals
+    kv("KOL", kolTicker);
+    kv("Total supply", totalSupply.toString());
+    kv("Vault transfer", vaultTransferAmount.toString());
     
     const [globalPackPoolAccount] = anchor.web3.PublicKey.findProgramAddressSync(
       [Buffer.from("global_pack_pool")], 
       program.programId
     );
+    kv("Global Pack Pool PDA", globalPackPoolAccount.toString());
     
     // CREATING THE MINT FIRST
-    console.log("\n📋 TRANSACTION 1: Creating new token mint...");
+    step("Create new mint");
     const newMintKeypair = anchor.web3.Keypair.generate();
-    
-    const createMintTx = await createMint(
+    await createMint(
       connection,
       admin,
       admin.publicKey, 
@@ -292,8 +168,7 @@ describe("pnlpackprogram", () => {
       6, 
       newMintKeypair 
     );
-    
-    console.log("✅ Mint created:", newMintKeypair.publicKey.toString());
+    kv("New mint", newMintKeypair.publicKey.toString());
     
     const adminTokenAccountInfo = await getOrCreateAssociatedTokenAccount(
       connection,
@@ -301,15 +176,9 @@ describe("pnlpackprogram", () => {
       newMintKeypair.publicKey,
       admin.publicKey
     );
+    kv("Admin ATA", adminTokenAccountInfo.address.toString());
     
-    console.log("✅ Admin token account created:", adminTokenAccountInfo.address.toString());
-    
-    // Transaction 2: COMBINED - Mint 1B tokens->admin + Init KOL Token Vault + Transfer 940M admin -> vault
-    console.log("\n🎯 TRANSACTION 2: SUPER COMBINED INSTRUCTION");
-    console.log("- Minting 1B tokens to admin");
-    console.log("- Initializing token vault");
-    console.log("- Transferring 940M tokens to vault");
-    
+    step("Derive token vault PDA");
     const [tokenVaultAccount] = anchor.web3.PublicKey.findProgramAddressSync(
       [
         Buffer.from("token_vault"),
@@ -318,19 +187,13 @@ describe("pnlpackprogram", () => {
       ],
       program.programId
     );
-    
-    console.log("Accounts:");
-    console.log("- Global pack pool:", globalPackPoolAccount.toString());
-    console.log("- Admin:", admin.publicKey.toString());
-    console.log("- Mint:", newMintKeypair.publicKey.toString());
-    console.log("- Admin token account:", adminTokenAccountInfo.address.toString());
-    console.log("- Token vault PDA:", tokenVaultAccount.toString());
+    kv("Token vault PDA", tokenVaultAccount.toString());
     
     const adminBalanceBefore = await getAccount(connection, adminTokenAccountInfo.address);
-    console.log("Admin token balance before:", Number(adminBalanceBefore.amount) / Math.pow(10, 6));
+    kv("Admin balance before (human)", Number(adminBalanceBefore.amount) / Math.pow(10, 6));
     
     const startTime = Date.now();
-    
+    step("Execute super combined instruction");
     const tx = await program.methods.mintAndInitKolTokenVaultAndTransfer(
         kolTicker, 
         totalSupply, 
@@ -349,183 +212,277 @@ describe("pnlpackprogram", () => {
       })
       .signers([admin])
       .rpc({ commitment: "confirmed" });
-    
     const endTime = Date.now();
-    const executionTime = endTime - startTime;
+    kv("Tx", tx);
+    kv("Exec time (ms)", endTime - startTime);
     
-    console.log("✅ SUPER COMBINED TRANSACTION COMPLETED:", tx);
-    console.log("⏱️  Execution time:", executionTime + "ms");
-    
-
-    console.log("\n📊 VERIFICATION:");
-    
-    // Check admin balance (should have 1B - 940M = 60M tokens)
     const adminBalanceAfter = await getAccount(connection, adminTokenAccountInfo.address);
     const expectedAdminBalance = 60000000; // 60M tokens
     const actualAdminBalance = Number(adminBalanceAfter.amount) / Math.pow(10, 6);
+    kv("Admin balance after (human)", actualAdminBalance);
+    kv("Expected admin balance", expectedAdminBalance);
     
-    console.log("Admin token balance after:", actualAdminBalance);
-    console.log("Expected admin balance:", expectedAdminBalance);
-    
-    // Check vault balance (should have 940M tokens)
     const vaultBalanceAfter = await getAccount(connection, tokenVaultAccount);
     const expectedVaultBalance = 940000000; // 940M tokens
     const actualVaultBalance = Number(vaultBalanceAfter.amount) / Math.pow(10, 6);
-    
-    console.log("Vault token balance:", actualVaultBalance);
-    console.log("Expected vault balance:", expectedVaultBalance);
-    
-    console.log("Vault mint:", vaultBalanceAfter.mint.toString());
-    console.log("Vault owner:", vaultBalanceAfter.owner.toString());
-    console.log("Expected mint:", newMintKeypair.publicKey.toString());
-    console.log("Expected owner (global pack pool):", globalPackPoolAccount.toString());
-    
+    kv("Vault balance (human)", actualVaultBalance);
+    kv("Expected vault balance", expectedVaultBalance);
+    kv("Vault mint", vaultBalanceAfter.mint.toString());
+    kv("Vault owner", vaultBalanceAfter.owner.toString());
+    kv("Expected mint", newMintKeypair.publicKey.toString());
+    kv("Expected owner (pool)", globalPackPoolAccount.toString());
 
     let allChecksPassed = true;
-    
-    if (Math.abs(actualAdminBalance - expectedAdminBalance) < 0.001) {
-      console.log("✅ Admin balance check PASSED");
-    } else {
-      console.log("❌ Admin balance check FAILED");
-      allChecksPassed = false;
-    }
-    
-    if (Math.abs(actualVaultBalance - expectedVaultBalance) < 0.001) {
-      console.log("✅ Vault balance check PASSED");
-    } else {
-      console.log("❌ Vault balance check FAILED");
-      allChecksPassed = false;
-    }
-    
-    if (vaultBalanceAfter.mint.toString() === newMintKeypair.publicKey.toString()) {
-      console.log("✅ Vault mint verification PASSED");
-    } else {
-      console.log("❌ Vault mint verification FAILED");
-      allChecksPassed = false;
-    }
-    
-    if (vaultBalanceAfter.owner.toString() === globalPackPoolAccount.toString()) {
-      console.log("✅ Vault authority verification PASSED");
-    } else {
-      console.log("❌ Vault authority verification FAILED");
-      allChecksPassed = false;
-    }
-    
-    console.log("\n🎉 SUPER COMBINED TRANSACTION SUMMARY:");
-    console.log("📈 Transaction reduction: 4 → 2 transactions (50% reduction!)");
-    console.log("⚡ Operations completed in single instruction:");
-    console.log("   1. ✅ Minted 1B tokens to admin");
-    console.log("   2. ✅ Initialized token vault");
-    console.log("   3. ✅ Transferred 940M tokens to vault");
-    console.log("⏱️  Total execution time:", executionTime + "ms");
-    console.log("🎯 All verifications:", allChecksPassed ? "PASSED ✅" : "FAILED ❌");
-    
-    if (allChecksPassed) {
-      console.log("\n🔥🔥 SUPER COMBINED INSTRUCTION SUCCESS! 🔥🔥");
-      console.log("Ready for production deployment with 50% fewer transactions!");
-    }
+    if (!(Math.abs(actualAdminBalance - expectedAdminBalance) < 0.001)) allChecksPassed = false;
+    if (!(Math.abs(actualVaultBalance - expectedVaultBalance) < 0.001)) allChecksPassed = false;
+    if (vaultBalanceAfter.mint.toString() !== newMintKeypair.publicKey.toString()) allChecksPassed = false;
+    if (vaultBalanceAfter.owner.toString() !== globalPackPoolAccount.toString()) allChecksPassed = false;
+    kv("All verifications", allChecksPassed ? "PASSED ✅" : "FAILED ❌");
   });
 
-  // // NEW TEST: Combined instruction to initialize vault and transfer tokens in one transaction
-  // it("[TEST6] Initialize token vault and transfer 940M tokens in single transaction (COMBINED)", async () => {
-  //   const kolTicker = "COMBT";
-  //   const transferAmount = new anchor.BN("940000000000000"); // 940M tokens with 6 decimals
-    
-  //   console.log(`\n🚀 COMBINED TRANSACTION: Initializing vault and transferring 940M tokens for ${kolTicker}...`);
-    
-  //   const [globalPackPoolAccount] = anchor.web3.PublicKey.findProgramAddressSync(
-  //     [Buffer.from("global_pack_pool")], 
-  //     program.programId
-  //   );
-    
-  //   const [tokenVaultAccount] = anchor.web3.PublicKey.findProgramAddressSync(
-  //     [
-  //       Buffer.from("token_vault"),
-  //       Buffer.from(kolTicker),
-  //       globalPackPoolAccount.toBuffer()
-  //     ],
-  //     program.programId
-  //   );
-    
-  //   const adminTokenAccountPDA = getAssociatedTokenAddressSync(
-  //     mintAddress,
-  //     admin.publicKey,
-  //     false,
-  //     TOKEN_PROGRAM_ID
-  //   );
-    
-  //   // Get admin balance before
-  //   const adminBalanceBefore = await getAccount(connection, adminTokenAccountPDA);
-  //   console.log("Admin balance before:", Number(adminBalanceBefore.amount) / Math.pow(10, 6));
-    
-  //   console.log("Global pack pool:", globalPackPoolAccount.toString());
-  //   console.log("Token vault PDA:", tokenVaultAccount.toString());
-  //   console.log("Admin token account:", adminTokenAccountPDA.toString());
-  //   console.log("Mint address:", mintAddress.toString());
-    
-  //   // Execute combined instruction
-  //   const tx = await program.methods.initKolTokenVaultAndTransfer(kolTicker, transferAmount)
-  //     .accountsPartial({
-  //       globalPackPool: globalPackPoolAccount,
-  //       admin: admin.publicKey,
-  //       mint: mintAddress,
-  //       adminTokenAccount: adminTokenAccountPDA,
-  //       tokenVault: tokenVaultAccount,
-  //       systemProgram: anchor.web3.SystemProgram.programId,
-  //       tokenProgram: TOKEN_PROGRAM_ID,
-  //       associatedTokenProgram: anchor.utils.token.ASSOCIATED_PROGRAM_ID,
-  //       rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-  //     })
-  //     .signers([admin])
-  //     .rpc({ commitment: "confirmed" });
-    
-  //   console.log("✅ Combined transaction completed successfully:", tx);
-    
-  //   // Verify results
-  //   const adminBalanceAfter = await getAccount(connection, adminTokenAccountPDA);
-  //   const vaultBalanceAfter = await getAccount(connection, tokenVaultAccount);
-    
-  //   console.log("\n📊 RESULTS:");
-  //   console.log("Admin balance after:", Number(adminBalanceAfter.amount) / Math.pow(10, 6));
-  //   console.log("Vault balance after:", Number(vaultBalanceAfter.amount) / Math.pow(10, 6));
-    
-  //   // Verify vault was created and has correct properties
-  //   console.log("Vault mint:", vaultBalanceAfter.mint.toString());
-  //   console.log("Vault owner:", vaultBalanceAfter.owner.toString());
-    
-  //   // Verify transfer amount
-  //   const transferredAmount = Number(vaultBalanceAfter.amount);
-  //   const expectedTransfer = 940000000000000; // 940M with 6 decimals
-    
-  //   console.log("Transferred amount (raw):", transferredAmount.toString());
-  //   console.log("Expected transfer (raw):", expectedTransfer.toString());
-  //   console.log("Transferred amount (human):", transferredAmount / Math.pow(10, 6));
-  //   console.log("Expected transfer (human):", expectedTransfer / Math.pow(10, 6));
-    
-  //   if (transferredAmount === expectedTransfer) {
-  //     console.log("✅ COMBINED TRANSACTION SUCCESS: Vault initialized and 940M tokens transferred!");
-  //     console.log("🎉 Transaction count reduced from 2 to 1!");
-  //   } else {
-  //     console.log("❌ Transfer amount mismatch!");
-  //     console.log("Difference:", Math.abs(transferredAmount - expectedTransfer));
-  //   }
-    
-  //   // Additional verification that vault is properly configured
-  //   if (vaultBalanceAfter.mint.toString() === mintAddress.toString()) {
-  //     console.log("✅ Vault mint verification passed");
-  //   } else {
-  //     console.log("❌ Vault mint verification failed");
-  //   }
-    
-  //   // Verify admin tokens were deducted
-  //   const adminTokensUsed = Number(adminBalanceBefore.amount) - Number(adminBalanceAfter.amount);
-  //   if (adminTokensUsed === expectedTransfer) {
-  //     console.log("✅ Admin token deduction verification passed");
-  //   } else {
-  //     console.log("❌ Admin token deduction verification failed");
-  //     console.log("Expected deduction:", expectedTransfer);
-  //     console.log("Actual deduction:", adminTokensUsed);
-  //   }
-  // });
+  it("[TEST9] pack_reveal initializes pack PDA and four ATAs, then transfers 40k each(total 160K)", async () => {
+    banner("TEST9: PACK REVEAL + TRANSFER 40K EACH TO PACK ATAs");
+    const [globalPackPoolAccount] = anchor.web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("global_pack_pool")],
+      program.programId
+    );
+    kv("Global Pack Pool PDA", globalPackPoolAccount.toString());
+
+    // Prepare four KOLs and mints, initialize their vaults using the combined instruction
+    const kols = ["KOLA", "KOLB", "KOLC", "KOLD"]; // short tickers
+    const kolMints: PublicKey[] = [];
+    const kolVaults: PublicKey[] = [];
+
+    banner("PHASE A: SETUP 4 KOL MINTS + VAULTS (MINT + INIT + TRANSFER)");
+    for (const kol of kols) {
+      step(`Create mint + ATA for ${kol}`);
+      const mintKeypair = anchor.web3.Keypair.generate();
+      await createMint(connection, admin, admin.publicKey, admin.publicKey, 6, mintKeypair);
+      kv("Mint", mintKeypair.publicKey.toString());
+
+      const adminAta = await getOrCreateAssociatedTokenAccount(
+        connection,
+        admin,
+        mintKeypair.publicKey,
+        admin.publicKey
+      );
+      kv("Admin ATA", adminAta.address.toString());
+
+      const [tokenVaultPda] = anchor.web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("token_vault"), Buffer.from(kol), globalPackPoolAccount.toBuffer()],
+        program.programId
+      );
+      kv("Token vault PDA", tokenVaultPda.toString());
+
+      const supply = new anchor.BN("1000000000000"); // 1,000,000 * 10^6
+      const toVault = new anchor.BN("900000000000"); // 900,000 * 10^6
+      step(`Super-combined: mint+init+transfer for ${kol}`);
+      const tx = await program.methods
+        .mintAndInitKolTokenVaultAndTransfer(kol, supply, toVault)
+        .accountsPartial({
+          globalPackPool: globalPackPoolAccount,
+          admin: admin.publicKey,
+          mint: mintKeypair.publicKey,
+          adminTokenAccount: adminAta.address,
+          tokenVault: tokenVaultPda,
+          systemProgram: anchor.web3.SystemProgram.programId,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: anchor.utils.token.ASSOCIATED_PROGRAM_ID,
+          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+        })
+        .signers([admin])
+        .rpc({ commitment: "confirmed" });
+      kv("Tx", tx);
+
+      kolMints.push(mintKeypair.publicKey);
+      kolVaults.push(tokenVaultPda);
+    }
+
+    banner("PHASE B: DERIVE PACK PDA + ATAs, THEN CALL pack_reveal");
+    step("Derive pack PDA");
+    const [packPda] = anchor.web3.PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("pack"),
+        Buffer.from(kols[0]),
+        Buffer.from(kols[1]),
+        Buffer.from(kols[2]),
+        Buffer.from(kols[3]),
+      ],
+      program.programId
+    );
+    kv("Pack PDA", packPda.toString());
+
+    const packAtas = kolMints.map((mint, idx) => {
+      const ata = getAssociatedTokenAddressSync(mint, packPda, true, TOKEN_PROGRAM_ID);
+      kv(`Expected Pack ATA [${idx}]`, ata.toString());
+      return ata;
+    });
+
+    step("Call pack_reveal");
+    try {
+      const tx = await retryRpc(() =>
+        program.methods
+          .packReveal(kols[0], kols[1], kols[2], kols[3])
+          .accountsPartial({
+            globalPackPool: globalPackPoolAccount,
+            admin: admin.publicKey,
+            packAccount: packPda,
+            mintKolA: kolMints[0],
+            packKolATa: packAtas[0],
+            mintKolB: kolMints[1],
+            packKolBTa: packAtas[1],
+            mintKolC: kolMints[2],
+            packKolCTa: packAtas[2],
+            mintKolD: kolMints[3],
+            packKolDTa: packAtas[3],
+            systemProgram: anchor.web3.SystemProgram.programId,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            associatedTokenProgram: anchor.utils.token.ASSOCIATED_PROGRAM_ID,
+          })
+          .signers([admin])
+          .rpc({ commitment: "confirmed" })
+      );
+      kv("pack_reveal tx", tx);
+    } catch (e: any) {
+      console.error("pack_reveal failed:", e);
+      if (e.logs) console.error("Program logs:", e.logs);
+      throw e;
+    }
+
+    banner("PHASE C: TRANSFER 40K OF EACH KOL TO PACK ATAs");
+    const transferAmount = new anchor.BN("40000000000"); // 40,000 * 10^6
+    for (let i = 0; i < 4; i++) {
+      const kol = kols[i];
+      step(`Transfer 40k ${kol} -> pack ATA`);
+      kv("Mint", kolMints[i].toString());
+      kv("Vault", kolVaults[i].toString());
+      kv("Pack ATA", packAtas[i].toString());
+      try {
+        const tx = await retryRpc(() =>
+          program.methods
+            .transferToIndividualPack(kol, transferAmount)
+            .accountsPartial({
+              globalPackPool: globalPackPoolAccount,
+              packAccount: packPda,
+              kolMint: kolMints[i],
+              kolTokenVault: kolVaults[i],
+              packKolTa: packAtas[i],
+              tokenProgram: TOKEN_PROGRAM_ID,
+              associatedTokenProgram: anchor.utils.token.ASSOCIATED_PROGRAM_ID,
+            })
+            .signers([admin])
+            .rpc({ commitment: "confirmed" })
+        );
+        kv("transfer_to_individual_pack tx", tx);
+      } catch (e: any) {
+        console.error(`transfer_to_individual_pack failed for ${kol}:`, e);
+        if (e.logs) console.error("Program logs:", e.logs);
+        throw e;
+      }
+    }
+
+    banner("PHASE D: VERIFY PACK ATAs (owner/mint/balance)");
+    for (let i = 0; i < 4; i++) {
+      step(`Verify Pack ATA[${i}]`);
+      const ataInfo = await getAccount(connection, packAtas[i]);
+      kv("Mint (actual)", ataInfo.mint.toString());
+      kv("Mint (expected)", kolMints[i].toString());
+      kv("Owner (actual)", ataInfo.owner.toString());
+      kv("Owner (expected)", packPda.toString());
+      kv("Amount (human)", Number(ataInfo.amount) / Math.pow(10, 6));
+
+      if (ataInfo.owner.toString() !== packPda.toString()) {
+        throw new Error(`Pack ATA[${i}] owner mismatch`);
+      }
+      if (ataInfo.mint.toString() !== kolMints[i].toString()) {
+        throw new Error(`Pack ATA[${i}] mint mismatch`);
+      }
+      if (ataInfo.amount.toString() !== transferAmount.toString()) {
+        throw new Error(`Pack ATA[${i}] amount mismatch; expected ${transferAmount.toString()}, got ${ataInfo.amount.toString()}`);
+      }
+      kv(`Pack ATA[${i}]`, "OK ✅");
+    }
+
+    banner("PHASE E: CLAIM 40K OF EACH KOL FROM PACK TO USER");
+    const userAtas = kolMints.map((mint, idx) => {
+      const ata = getAssociatedTokenAddressSync(mint, admin.publicKey, false, TOKEN_PROGRAM_ID);
+      kv(`Expected User ATA [${idx}]`, ata.toString());
+      return ata;
+    });
+
+    // Balances before claim
+    const userBalancesBefore: bigint[] = [];
+    const packBalancesBefore: bigint[] = [];
+    for (let i = 0; i < 4; i++) {
+      const uAcc = await getAccount(connection, userAtas[i]).catch(() => null); // might not exist yet
+      userBalancesBefore.push(uAcc ? uAcc.amount : 0n);
+      const pAcc = await getAccount(connection, packAtas[i]);
+      packBalancesBefore.push(pAcc.amount);
+    }
+
+    try {
+      step("Call claim_from_pack");
+      const tx = await retryRpc(() =>
+        program.methods
+          .claimFromPack(kols[0], kols[1], kols[2], kols[3], transferAmount)
+          .accountsPartial({
+            pack: packPda,
+            user: admin.publicKey,
+            // A
+            mintKolA: kolMints[0],
+            packKolATa: packAtas[0],
+            userKolATa: userAtas[0],
+            // B
+            mintKolB: kolMints[1],
+            packKolBTa: packAtas[1],
+            userKolBTa: userAtas[1],
+            // C
+            mintKolC: kolMints[2],
+            packKolCTa: packAtas[2],
+            userKolCTa: userAtas[2],
+            // D
+            mintKolD: kolMints[3],
+            packKolDTa: packAtas[3],
+            userKolDTa: userAtas[3],
+            // programs
+            systemProgram: anchor.web3.SystemProgram.programId,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            associatedTokenProgram: anchor.utils.token.ASSOCIATED_PROGRAM_ID,
+          })
+          .signers([admin])
+          .rpc({ commitment: "confirmed" })
+      );
+      kv("claim_from_pack tx", tx);
+    } catch (e: any) {
+      console.error("claim_from_pack failed:", e);
+      if (e.logs) console.error("Program logs:", e.logs);
+      throw e;
+    }
+
+    banner("PHASE F: VERIFY USER + PACK BALANCES AFTER CLAIM");
+    for (let i = 0; i < 4; i++) {
+      step(`Verify after claim [${i}]`);
+      const userAcc = await getAccount(connection, userAtas[i]);
+      const packAcc = await getAccount(connection, packAtas[i]);
+      kv("User ATA (actual)", userAcc.amount.toString());
+      kv("User ATA (expected add)", transferAmount.toString());
+      kv("Pack ATA (actual)", packAcc.amount.toString());
+      kv("Pack ATA (expected)", "0");
+
+      // User increased by +40k, Pack decreased by -40k
+      const expectedUser = (userBalancesBefore[i] + BigInt(transferAmount.toString())).toString();
+      if (userAcc.amount.toString() !== expectedUser) {
+        throw new Error(`User ATA[${i}] amount mismatch; expected ${expectedUser}, got ${userAcc.amount.toString()}`);
+      }
+      if (packAcc.amount !== 0n) {
+        throw new Error(`Pack ATA[${i}] expected 0 after claim, got ${packAcc.amount.toString()}`);
+      }
+      kv(`Post-claim [${i}]`, "OK ✅");
+    }
+
+    banner("✅ TEST9 COMPLETE: PACK CREATED + FUNDED + CLAIMED TO USER (40K EACH)");
+  });
+
+  
 
 });
